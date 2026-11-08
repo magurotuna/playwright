@@ -394,6 +394,17 @@ class NetworkRequest {
     // we do not get onResponse normally, but we do get nsIStreamListener notifications.
     this._sendOnResponse(false);
 
+    // The body comes from the original content of the cache entry, so do not copy
+    // the alternative data.
+    if (this._originalBodyPromise) {
+      try {
+        this._originalListener.onDataAvailable(aRequest, aInputStream, aOffset, aCount);
+      } catch (e) {
+        // Be ready to original listener exceptions.
+      }
+      return;
+    }
+
     const iStream = new BinaryInputStream(aInputStream);
     const sStream = new StorageStream(8192, aCount, null);
     const oStream = new BinaryOutputStream(sStream.getOutputStream(0));
@@ -423,6 +434,11 @@ class NetworkRequest {
     } catch (e) {
       // Be ready to original listener exceptions.
     }
+    // A response from the cache can deliver alternative data instead of the
+    // original content, for example JavaScript bytecode for a cached script.
+    // Report the original content as the response body.
+    if (this._pageNetwork && hasAlternativeData(aRequest))
+      this._originalBodyPromise = readOriginalCacheContent(aRequest);
   }
 
   // nsIStreamListener
@@ -442,6 +458,27 @@ class NetworkRequest {
       // For requests with internal redirect (e.g. intercepted by Service Worker),
       // we do not get onResponse normally, but we do get nsIRequestObserver notifications.
       this._sendOnResponse(false);
+      const originalBodyPromise = this._originalBodyPromise;
+      if (originalBodyPromise) {
+        delete this._originalBodyPromise;
+        delete this._responseBodyChunks;
+        // Read the sizes now. After onStopRequest, |encodedBodySize| reports the
+        // length of the alternative data instead of the original content.
+        const finishedEvent = this._requestFinishedEvent();
+        // Emit "requestFinished" after the body is stored: clients read the body after it.
+        originalBodyPromise.then(body => {
+          const pageNetwork = this._pageNetwork;
+          if (pageNetwork) {
+            if (body === null)
+              pageNetwork._responseStorage.addEvictedResponse(this);
+            else
+              pageNetwork._responseStorage.addResponseBody(this, body);
+          }
+          this._sendOnRequestFinished(finishedEvent);
+          this._releaseReferences();
+        });
+        return;
+      }
       const body = this._responseBodyChunks.join('');
       const pageNetwork = this._pageNetwork;
       if (pageNetwork)
@@ -451,6 +488,7 @@ class NetworkRequest {
       this._sendOnRequestFailed(aStatusCode);
     }
 
+    delete this._originalBodyPromise;
     delete this._responseBodyChunks;
     this._releaseReferences();
   }
@@ -599,28 +637,38 @@ class NetworkRequest {
     this._networkObserver._channelToRequest.delete(this.httpChannel);
   }
 
-  _sendOnRequestFinished() {
+  // |finishedEvent| is the result of an earlier _requestFinishedEvent() call, if any.
+  _sendOnRequestFinished(finishedEvent) {
     const pageNetwork = this._pageNetwork;
+    if (pageNetwork) {
+      if (finishedEvent === undefined)
+        finishedEvent = this._requestFinishedEvent();
+      if (finishedEvent)
+        pageNetwork.emit(PageNetwork.Events.RequestFinished, finishedEvent, this._frameId);
+    }
+    this._networkObserver._channelToRequest.delete(this.httpChannel);
+  }
+
+  _requestFinishedEvent() {
     // Undefined |responseEndTime| means there has been no response yet.
     // This happens when request interception API is used to redirect
     // the request to a different URL.
     // In this case, we should not emit "requestFinished" event.
-    if (pageNetwork && this.httpChannel.responseEndTime !== undefined) {
-      let protocolVersion = undefined;
-      try {
-        protocolVersion = this.httpChannel.protocolVersion;
-      } catch (e) {
-        // protocolVersion is unavailable in certain cases.
-      };
-      pageNetwork.emit(PageNetwork.Events.RequestFinished, {
-        requestId: this.requestId,
-        responseEndTime: this.httpChannel.responseEndTime,
-        transferSize: this.httpChannel.transferSize,
-        encodedBodySize: this.httpChannel.encodedBodySize,
-        protocolVersion,
-      }, this._frameId);
-    }
-    this._networkObserver._channelToRequest.delete(this.httpChannel);
+    if (this.httpChannel.responseEndTime === undefined)
+      return null;
+    let protocolVersion = undefined;
+    try {
+      protocolVersion = this.httpChannel.protocolVersion;
+    } catch (e) {
+      // protocolVersion is unavailable in certain cases.
+    };
+    return {
+      requestId: this.requestId,
+      responseEndTime: this.httpChannel.responseEndTime,
+      transferSize: this.httpChannel.transferSize,
+      encodedBodySize: this.httpChannel.encodedBodySize,
+      protocolVersion,
+    };
   }
 }
 
@@ -904,6 +952,61 @@ function causeTypeToString(causeType) {
   return 'TYPE_OTHER';
 }
 
+function hasAlternativeData(channel) {
+  try {
+    return channel instanceof Ci.nsICacheInfoChannel && !!channel.alternativeDataType;
+  } catch (e) {
+    // Accessing |alternativeDataType| throws for some channels, for example
+    // the ones that a service worker intercepts.
+    return false;
+  }
+}
+
+// Resolves with the original content of the cache entry that |channel| reads
+// from, as a binary string, or with null if it is not available.
+function readOriginalCacheContent(channel) {
+  return new Promise(resolve => {
+    try {
+      channel.getOriginalInputStream({
+        onInputStreamReady(stream) {
+          if (!stream) {
+            resolve(null);
+            return;
+          }
+          try {
+            NetUtil.asyncFetch(stream, (bufferedStream, status) => {
+              try {
+                if (!Components.isSuccessCode(status)) {
+                  resolve(null);
+                  return;
+                }
+                let size = 0;
+                try {
+                  size = bufferedStream.available();
+                } catch (e) {
+                  // An empty stream reports that it is closed.
+                  if (e.result !== Cr.NS_BASE_STREAM_CLOSED)
+                    throw e;
+                }
+                resolve(size ? NetUtil.readInputStreamToString(bufferedStream, size) : '');
+              } catch (e) {
+                resolve(null);
+              } finally {
+                bufferedStream.close();
+              }
+            });
+          } catch (e) {
+            stream.close();
+            resolve(null);
+          }
+        },
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
 function appendExtraHTTPHeaders(httpChannel, headers) {
   if (!headers)
     return;
@@ -919,12 +1022,16 @@ class ResponseStorage {
     this._responses = new Map();
   }
 
+  addEvictedResponse(request) {
+    this._responses.set(request.requestId, {
+      evicted: true,
+      body: '',
+    });
+  }
+
   addResponseBody(request, body) {
     if (body.length > this._maxResponseSize) {
-      this._responses.set(request.requestId, {
-        evicted: true,
-        body: '',
-      });
+      this.addEvictedResponse(request);
       return;
     }
     let encodings = [];
