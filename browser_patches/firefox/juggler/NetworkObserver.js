@@ -917,6 +917,8 @@ class ResponseStorage {
     this._maxResponseSize = maxResponseSize;
     this._maxTotalSize = maxTotalSize;
     this._responses = new Map();
+    // Ids of the responses whose bodies are not evicted yet, in insertion order.
+    this._liveResponseIds = new Set();
   }
 
   addResponseBody(request, body) {
@@ -943,9 +945,14 @@ class ResponseStorage {
       encodings,
       httpChannel: encodings.length ? request.httpChannel : null,
     });
+    this._liveResponseIds.add(request.requestId);
     this._totalSize += body.length;
     if (this._totalSize > this._maxTotalSize) {
-      for (let [requestId, response] of this._responses) {
+      // Iterate over live responses only: evicted entries stay in |_responses|,
+      // and visiting them again on every eviction is quadratic.
+      for (const requestId of this._liveResponseIds) {
+        const response = this._responses.get(requestId);
+        this._liveResponseIds.delete(requestId);
         this._totalSize -= response.body.length;
         response.body = '';
         response.evicted = true;
